@@ -1,0 +1,83 @@
+/# Ignore the copied test deployment directory (local test artefact)
+/bodian-test/
+
+# Build directories and CMake output
+/build/
+/bin/
+/lib/
+/generated/
+/CMakeFiles/
+/*/Debug/
+/*/Release/
+/*/RelWithDebInfo/
+/*/MinSizeRel/
+
+# CMake cache and install files
+/CMakeCache.txt
+/cmake_install.cmake
+/InstallScripts.json
+
+# Visual Studio / MSBuild
+/.vs/
+*.sln
+*.vcxproj*
+*.vcxproj.user
+*.vcxproj.filters
+*.suo
+*.user
+*.userosscache
+*.VC.db
+*.VC.opendb
+
+# IDEs
+/.vscode/
+/.idea/
+*.code-workspace
+
+# Generated binaries, intermediate and linker files
+*.obj
+*.o
+*.lo
+*.lib
+*.exp
+*.ilk
+*.idb
+*.pdb
+*.dll
+*.exe
+
+# Specific project-generated files
+/lib/RelWithDebInfo/
+/build/RelWithDebInfo/
+/build/*.recipe
+/build/*.ilk
+/build/*.exp
+/generated/libmpv_forward_table.cpp
+/generated/libmpv_forward_thunks.asm
+/libmpv_proxy.def
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+env/
+ENV/
+.env
+.venv
+.pytest_cache/
+
+# OS files
+Thumbs.db
+.DS_Store
+ehthumbs.db
+
+# Logs, temp and backup files
+*.log
+*.tmp
+*.temp
+*.bak
+
+# Misc
+*.swp
+*.swo
+*.lock
