@@ -2,8 +2,8 @@
 
 该工程为无源码波点音乐实现 SMTC 的原型：
 
-- `mpv_proxy`：同名代理 `libmpv-2.dll`，转发原 DLL 并采集 mpv 状态。
-- `bodian_smtc_bridge`：接收代理状态，结合波点日志补齐歌曲信息，并发布 Windows SMTC。
+- `mpv_proxy`：同名代理 `libmpv-2.dll`，转发原 DLL，采集 mpv 状态，并在波点进程内发布 Windows SMTC。
+- 进程内 Bridge：随播放引擎初始化启动，异步绑定波点主窗口，结合波点日志补齐歌曲信息。
 - 部署脚本只准备复制出来的测试目录，不修改原安装目录。
 
 ## 构建
@@ -21,7 +21,6 @@
 ## 启动
 
 ```powershell
-.\bodian-test\bodian\bodian_smtc_bridge.exe
 .\bodian-test\bodian\bodian_pc.exe
 ```
 

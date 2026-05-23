@@ -33,6 +33,7 @@ add_custom_command(
 
 add_library(mpv_proxy SHARED
     src/proxy/mpv_proxy.cpp
+    src/bridge/bridge_core.cpp
     "${PROXY_ASM}"
     "${PROXY_TABLE}"
     "${PROXY_DEF}"
@@ -54,26 +55,10 @@ target_compile_definitions(mpv_proxy PRIVATE
 
 target_compile_options(mpv_proxy PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
 
-target_link_libraries(mpv_proxy PRIVATE advapi32)
+target_include_directories(mpv_proxy PRIVATE src)
 
-add_executable(bodian_smtc_bridge WIN32
-    src/bridge/main.cpp
-)
-
-set_target_properties(bodian_smtc_bridge PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-)
-
-target_compile_definitions(bodian_smtc_bridge PRIVATE
-    UNICODE
-    _UNICODE
-    NOMINMAX
-    WIN32_LEAN_AND_MEAN
-)
-
-target_compile_options(bodian_smtc_bridge PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
-
-target_link_libraries(bodian_smtc_bridge PRIVATE
+target_link_libraries(mpv_proxy PRIVATE
+    advapi32
     runtimeobject
     urlmon
     windowsapp

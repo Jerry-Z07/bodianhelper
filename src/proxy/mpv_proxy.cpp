@@ -1,17 +1,15 @@
 #include <windows.h>
 
+#include "../bridge/bridge_core.h"
+
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
-#include <cstdio>
-#include <deque>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <vector>
+#include <utility>
 
 struct mpv_handle;
 struct mpv_event;
@@ -40,22 +38,17 @@ enum mpv_format {
 namespace {
 
 constexpr wchar_t kRealDllName[] = L"libmpv_real.dll";
-constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\bodian-smtc-bridge";
 constexpr int64_t kStateSnapshotIntervalMs = 5000;
 
 HMODULE g_real_module = nullptr;
 std::once_flag g_load_once;
 std::atomic<mpv_handle*> g_active_handle{nullptr};
 std::atomic<bool> g_sampler_running{false};
+std::atomic<bool> g_bridge_started{false};
 std::atomic<bool> g_process_exiting{false};
 std::atomic<int64_t> g_last_snapshot_ms{0};
+std::atomic<int64_t> g_ignore_synthetic_media_key_until_ms{0};
 std::thread g_sampler_thread;
-
-std::mutex g_pipe_mutex;
-HANDLE g_pipe = INVALID_HANDLE_VALUE;
-std::deque<std::string> g_outbox;
-std::atomic<bool> g_pipe_running{false};
-std::thread g_pipe_thread;
 
 using mpv_create_fn = mpv_handle* (*)();
 using mpv_destroy_fn = void (*)(mpv_handle*);
@@ -70,50 +63,6 @@ using mpv_set_property_string_fn = int (*)(mpv_handle*, const char*, const char*
 using mpv_free_fn = void (*)(void*);
 using mpv_wait_event_fn = mpv_event* (*)(mpv_handle*, double);
 using mpv_wakeup_fn = void (*)(mpv_handle*);
-
-std::string WideToUtf8(std::wstring_view value) {
-    if (value.empty()) {
-        return {};
-    }
-    const int size = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-    std::string result(size, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size, nullptr, nullptr);
-    return result;
-}
-
-std::string JsonEscape(std::string_view value) {
-    std::string escaped;
-    escaped.reserve(value.size() + 8);
-    for (const unsigned char ch : value) {
-        switch (ch) {
-        case '\\':
-            escaped += "\\\\";
-            break;
-        case '"':
-            escaped += "\\\"";
-            break;
-        case '\n':
-            escaped += "\\n";
-            break;
-        case '\r':
-            escaped += "\\r";
-            break;
-        case '\t':
-            escaped += "\\t";
-            break;
-        default:
-            if (ch < 0x20) {
-                char buffer[7]{};
-                std::snprintf(buffer, sizeof(buffer), "\\u%04x", ch);
-                escaped += buffer;
-            } else {
-                escaped += static_cast<char>(ch);
-            }
-            break;
-        }
-    }
-    return escaped;
-}
 
 int64_t NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -149,16 +98,6 @@ FARPROC ResolveRealProc(const char* name) {
 template <typename T>
 T Real(const char* name) {
     return reinterpret_cast<T>(ResolveRealProc(name));
-}
-
-void QueueMessage(std::string message) {
-    {
-        std::lock_guard lock(g_pipe_mutex);
-        if (g_outbox.size() > 256) {
-            g_outbox.pop_front();
-        }
-        g_outbox.push_back(std::move(message));
-    }
 }
 
 std::string ReadStringProperty(mpv_handle* handle, const char* name) {
@@ -219,18 +158,17 @@ void SendStateSnapshot(mpv_handle* handle) {
     const std::string path = ReadStringProperty(handle, "path");
     const std::string filename = ReadStringProperty(handle, "filename");
 
-    std::ostringstream json;
-    json << "{\"type\":\"state\""
-         << ",\"playing\":" << ((!paused && !idle && !eof) ? "true" : "false")
-         << ",\"positionMs\":" << static_cast<int64_t>(position * 1000.0)
-         << ",\"durationMs\":" << static_cast<int64_t>(duration * 1000.0)
-         << ",\"speed\":" << speed
-         << ",\"title\":\"" << JsonEscape(title) << "\""
-         << ",\"path\":\"" << JsonEscape(path) << "\""
-         << ",\"filename\":\"" << JsonEscape(filename) << "\""
-         << ",\"timestampMs\":" << NowMs()
-         << "}\n";
-    QueueMessage(json.str());
+    bodian_bridge::PlaybackState state;
+    state.connected = true;
+    state.playing = !paused && !idle && !eof;
+    state.position_ms = static_cast<int64_t>(position * 1000.0);
+    state.duration_ms = static_cast<int64_t>(duration * 1000.0);
+    state.speed = speed;
+    state.timestamp_ms = NowMs();
+    state.title = title;
+    state.path = path;
+    state.filename = filename;
+    bodian_bridge::SubmitPlaybackState(state);
 }
 
 void SendStateSnapshotThrottled(mpv_handle* handle) {
@@ -248,118 +186,53 @@ void SendStateSnapshotThrottled(mpv_handle* handle) {
     }
 }
 
-void ApplyBridgeCommand(std::string_view line) {
+void SetPause(bool pause) {
     mpv_handle* handle = g_active_handle.load();
-    auto command = Real<mpv_command_fn>("mpv_command");
     auto set_property = Real<mpv_set_property_fn>("mpv_set_property");
-    if (handle == nullptr) {
+    if (handle == nullptr || set_property == nullptr) {
         return;
     }
 
-    if (line.find("\"command\":\"play\"") != std::string_view::npos && set_property != nullptr) {
-        int value = 0;
-        set_property(handle, "pause", MPV_FORMAT_FLAG, &value);
-    } else if (line.find("\"command\":\"pause\"") != std::string_view::npos && set_property != nullptr) {
-        int value = 1;
-        set_property(handle, "pause", MPV_FORMAT_FLAG, &value);
-    } else if (line.find("\"command\":\"toggle\"") != std::string_view::npos && command != nullptr) {
-        const char* args[] = {"cycle", "pause", nullptr};
-        command(handle, args);
-    } else if (line.find("\"command\":\"next\"") != std::string_view::npos && command != nullptr) {
-        const char* args[] = {"playlist-next", "force", nullptr};
-        command(handle, args);
-    } else if (line.find("\"command\":\"previous\"") != std::string_view::npos && command != nullptr) {
-        const char* args[] = {"playlist-prev", "force", nullptr};
-        command(handle, args);
-    } else {
-        const std::string marker = "\"command\":\"seekToMs\"";
-        const size_t command_pos = line.find(marker);
-        const size_t value_pos = line.find("\"positionMs\":");
-        if (command_pos != std::string_view::npos && value_pos != std::string_view::npos && command != nullptr) {
-            const char* start = line.data() + value_pos + 13;
-            char* end = nullptr;
-            const long long position_ms = std::strtoll(start, &end, 10);
-            std::string seconds = std::to_string(static_cast<double>(position_ms) / 1000.0);
-            const char* args[] = {"seek", seconds.c_str(), "absolute", "exact", nullptr};
-            command(handle, args);
-        }
-    }
+    int value = pause ? 1 : 0;
+    set_property(handle, "pause", MPV_FORMAT_FLAG, &value);
+    SendStateSnapshot(handle);
 }
 
-void PipeWorker() {
-    std::string read_buffer;
-    while (!g_process_exiting.load()) {
-        HANDLE pipe = INVALID_HANDLE_VALUE;
-        {
-            std::lock_guard lock(g_pipe_mutex);
-            pipe = g_pipe;
-        }
-
-        if (pipe == INVALID_HANDLE_VALUE) {
-            HANDLE new_pipe = CreateFileW(
-                kPipeName,
-                GENERIC_READ | GENERIC_WRITE,
-                0,
-                nullptr,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                nullptr);
-
-            if (new_pipe == INVALID_HANDLE_VALUE) {
-                Sleep(1000);
-                continue;
-            }
-
-            DWORD mode = PIPE_READMODE_BYTE;
-            SetNamedPipeHandleState(new_pipe, &mode, nullptr, nullptr);
-            std::lock_guard lock(g_pipe_mutex);
-            g_pipe = new_pipe;
-            pipe = new_pipe;
-        }
-
-        std::string next_message;
-        {
-            std::lock_guard lock(g_pipe_mutex);
-            if (!g_outbox.empty()) {
-                next_message = std::move(g_outbox.front());
-                g_outbox.pop_front();
-            }
-        }
-
-        if (!next_message.empty()) {
-            DWORD written = 0;
-            if (!WriteFile(pipe, next_message.data(), static_cast<DWORD>(next_message.size()), &written, nullptr)) {
-                std::lock_guard lock(g_pipe_mutex);
-                CloseHandle(g_pipe);
-                g_pipe = INVALID_HANDLE_VALUE;
-                continue;
-            }
-        }
-
-        DWORD available = 0;
-        if (PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
-            std::vector<char> buffer(available);
-            DWORD read = 0;
-            if (ReadFile(pipe, buffer.data(), available, &read, nullptr)) {
-                read_buffer.append(buffer.data(), read);
-                size_t newline = std::string::npos;
-                while ((newline = read_buffer.find('\n')) != std::string::npos) {
-                    std::string line = read_buffer.substr(0, newline);
-                    read_buffer.erase(0, newline + 1);
-                    ApplyBridgeCommand(line);
-                }
-            }
-        }
-
-        Sleep(next_message.empty() ? 50 : 5);
+void SeekToMs(int64_t position_ms) {
+    mpv_handle* handle = g_active_handle.load();
+    auto command = Real<mpv_command_fn>("mpv_command");
+    if (handle == nullptr || command == nullptr) {
+        return;
     }
+
+    std::string seconds = std::to_string(static_cast<double>(position_ms) / 1000.0);
+    const char* args[] = {"seek", seconds.c_str(), "absolute", "exact", nullptr};
+    command(handle, args);
+    SendStateSnapshot(handle);
 }
 
-void EnsurePipeWorker() {
+void SendSyntheticMediaKey(BYTE virtual_key) {
+    const int64_t now = NowMs();
+    if (now < g_ignore_synthetic_media_key_until_ms.load()) {
+        return;
+    }
+
+    // 波点的 Dart 侧媒体键监听只响应真实键盘事件，SMTC 切歌需模拟系统媒体键。
+    g_ignore_synthetic_media_key_until_ms.store(now + 500);
+    keybd_event(virtual_key, 0, 0, 0);
+    keybd_event(virtual_key, 0, KEYEVENTF_KEYUP, 0);
+}
+
+void EnsureBridge() {
     bool expected = false;
-    if (g_pipe_running.compare_exchange_strong(expected, true)) {
-        g_pipe_thread = std::thread(PipeWorker);
-        g_pipe_thread.detach();
+    if (g_bridge_started.compare_exchange_strong(expected, true)) {
+        bodian_bridge::ControlCallbacks callbacks;
+        callbacks.play = [] { SetPause(false); };
+        callbacks.pause = [] { SetPause(true); };
+        callbacks.next = [] { SendSyntheticMediaKey(VK_MEDIA_NEXT_TRACK); };
+        callbacks.previous = [] { SendSyntheticMediaKey(VK_MEDIA_PREV_TRACK); };
+        callbacks.seek_to_ms = [](int64_t position_ms) { SeekToMs(position_ms); };
+        bodian_bridge::StartSmtcBridge(std::move(callbacks));
     }
 }
 
@@ -374,7 +247,6 @@ void SamplerWorker() {
 }
 
 void EnsureSampler() {
-    EnsurePipeWorker();
     bool expected = false;
     if (g_sampler_running.compare_exchange_strong(expected, true)) {
         g_sampler_thread = std::thread(SamplerWorker);
@@ -383,10 +255,12 @@ void EnsureSampler() {
 }
 
 void NotifyEvent(std::string_view name, mpv_handle* handle) {
-    std::ostringstream json;
-    json << "{\"type\":\"event\",\"name\":\"" << JsonEscape(name) << "\",\"timestampMs\":" << NowMs() << "}\n";
-    QueueMessage(json.str());
-    SendStateSnapshot(handle);
+    (void)name;
+    if (handle == nullptr) {
+        bodian_bridge::MarkPlaybackDisconnected();
+    } else {
+        SendStateSnapshot(handle);
+    }
 }
 
 } // namespace
@@ -399,8 +273,6 @@ extern "C" __declspec(dllexport) mpv_handle* mpv_create() {
     mpv_handle* handle = real();
     if (handle != nullptr) {
         g_active_handle.store(handle);
-        EnsureSampler();
-        NotifyEvent("mpv_create", handle);
     }
     return handle;
 }
@@ -411,7 +283,6 @@ extern "C" __declspec(dllexport) mpv_handle* mpv_create_client(mpv_handle* handl
     mpv_handle* client = real ? real(handle, name) : nullptr;
     if (client != nullptr) {
         g_active_handle.store(client);
-        EnsureSampler();
     }
     return client;
 }
@@ -422,7 +293,6 @@ extern "C" __declspec(dllexport) mpv_handle* mpv_create_weak_client(mpv_handle* 
     mpv_handle* client = real ? real(handle, name) : nullptr;
     if (client != nullptr) {
         g_active_handle.store(client);
-        EnsureSampler();
     }
     return client;
 }
@@ -432,6 +302,7 @@ extern "C" __declspec(dllexport) int mpv_initialize(mpv_handle* handle) {
     const int result = real ? real(handle) : -1;
     if (result >= 0) {
         g_active_handle.store(handle);
+        EnsureBridge();
         EnsureSampler();
         NotifyEvent("mpv_initialize", handle);
     }
@@ -538,11 +409,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         LoadRealModule();
     } else if (reason == DLL_PROCESS_DETACH) {
         g_process_exiting.store(true);
-        std::lock_guard lock(g_pipe_mutex);
-        if (g_pipe != INVALID_HANDLE_VALUE) {
-            CloseHandle(g_pipe);
-            g_pipe = INVALID_HANDLE_VALUE;
-        }
+        bodian_bridge::StopSmtcBridge();
     }
     return TRUE;
 }

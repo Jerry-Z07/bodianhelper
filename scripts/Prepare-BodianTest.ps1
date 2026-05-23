@@ -1,5 +1,6 @@
 param(
     [string]$Configuration = "RelWithDebInfo",
+    [string]$BuildDir = "build",
     [string]$SourceDir = "C:\Program Files (x86)\bodian",
     [string]$TestRoot = "E:\VMShare\board\test\bodian-test"
 )
@@ -7,15 +8,11 @@ param(
 $ErrorActionPreference = "Stop"
 
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
-$buildBin = Join-Path $root "build\bin\$Configuration"
+$buildBin = Join-Path $root "$BuildDir\bin\$Configuration"
 $testBodian = Join-Path $TestRoot "bodian"
 
 if (-not (Test-Path -LiteralPath (Join-Path $buildBin "libmpv-2.dll"))) {
     throw "未找到代理 DLL，请先运行 scripts\Build.ps1"
-}
-
-if (-not (Test-Path -LiteralPath (Join-Path $buildBin "bodian_smtc_bridge.exe"))) {
-    throw "未找到 Bridge，请先运行 scripts\Build.ps1"
 }
 
 if (-not (Test-Path -LiteralPath $testBodian)) {
@@ -37,9 +34,7 @@ if (-not (Test-Path -LiteralPath $realMpv)) {
 }
 
 Copy-Item -LiteralPath (Join-Path $buildBin "libmpv-2.dll") -Destination $originalMpv -Force
-Copy-Item -LiteralPath (Join-Path $buildBin "bodian_smtc_bridge.exe") -Destination (Join-Path $testBodian "bodian_smtc_bridge.exe") -Force
 
 Write-Host "测试目录已准备: $testBodian"
-Write-Host "启动顺序:"
-Write-Host "  1. $testBodian\bodian_smtc_bridge.exe"
-Write-Host "  2. $testBodian\bodian_pc.exe"
+Write-Host "启动:"
+Write-Host "  $testBodian\bodian_pc.exe"

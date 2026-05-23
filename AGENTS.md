@@ -5,7 +5,7 @@
 本工程是为无源码的波点音乐 Windows 客户端实现 SMTC（System Media Transport Controls）集成的原型。当前方案由两部分组成：
 
 - `mpv_proxy`：生成同名 `libmpv-2.dll`，转发原始 `libmpv_real.dll` 的导出，并采集 mpv 播放状态。
-- `bodian_smtc_bridge`：通过命名管道接收代理状态，结合波点日志解析歌曲元数据，并发布到 Windows SMTC。
+- 进程内 Bridge：由代理 DLL 在波点进程内启动，结合波点日志解析歌曲元数据，并发布到 Windows SMTC。
 
 默认只操作仓库根目录和 `bodian-test` 复制目录。未经明确确认，不得修改 `C:\Program Files (x86)\bodian`。
 
@@ -34,7 +34,6 @@
 测试启动顺序：
 
 ```powershell
-.\bodian-test\bodian\bodian_smtc_bridge.exe
 .\bodian-test\bodian\bodian_pc.exe
 ```
 
@@ -45,10 +44,11 @@
 - 代理 DLL 必须保持原 `libmpv-2.dll` 的导出兼容性，包括名称和序号。
 - 代理侧常规状态快照频率为 5 秒。
 - Bridge 侧 `UpdateTimelineProperties` 也需要做最终节流：播放中约每 5 秒更新一次，暂停、跳转、切歌、时长变化时立即更新。
+- Bridge 在 `mpv_initialize` 成功后启动，随波点进程退出而关闭。
+- SMTC 绑定当前进程内可见、无 owner、非工具窗口、面积最大的顶层窗口。
 - SMTC 元数据更新和 timeline 更新应分开判断，避免进度刷新带来元数据重复提交。
-- 封面优先走本地缓存文件流：下载到 `%LOCALAPPDATA%\BodianSmtcBridge\album-art`，再通过 `StorageFile` 和 `RandomAccessStreamReference::CreateFromFile` 传给 SMTC。
+- 封面需要时直接获取并转换为 JPEG 内存流，再通过 `RandomAccessStreamReference::CreateFromStream` 传给 SMTC。
 - 波点日志里的 `.webp` 封面优先改取同路径 `.jpg`，以提高 SMTC 解码成功率。
-- 封面缓存清理策略：每小时最多清理一次，删除 3 天未使用的 `.jpg/.png`，最多保留最近使用的 50 个文件。
 
 ## 代码规范
 
@@ -75,11 +75,12 @@
 
 涉及代理导出或 DLL 加载时，补充最小 smoke test：从 `bodian-test\bodian` 加载 `libmpv-2.dll`，调用转发导出 `mpv_client_api_version()`，期望返回有效版本值。
 
-涉及 Bridge 行为时，至少启动 `bodian_smtc_bridge.exe` 数秒，确认进程可存活。涉及封面缓存时，确认 `%LOCALAPPDATA%\BodianSmtcBridge\album-art` 生成非空图片文件。
+涉及 Bridge 行为时，至少启动测试目录中的 `bodian_pc.exe` 数秒，确认波点进程可存活且无需单独 Bridge 进程。涉及封面时，确认无需生成 `%LOCALAPPDATA%\BodianSmtcBridge\album-art` 缓存目录。
 
 ## 参考资料
 
 - Microsoft SMTC 手动控制文档：<https://learn.microsoft.com/windows/apps/develop/media-playback/system-media-transport-controls>
 - `SystemMediaTransportControlsDisplayUpdater.Thumbnail`：<https://learn.microsoft.com/uwp/api/windows.media.systemmediatransportcontrolsdisplayupdater.thumbnail>
-- `RandomAccessStreamReference.CreateFromFile`：<https://learn.microsoft.com/uwp/api/windows.storage.streams.randomaccessstreamreference.createfromfile>
+- `RandomAccessStreamReference.CreateFromStream`：<https://learn.microsoft.com/uwp/api/windows.storage.streams.randomaccessstreamreference.createfromstream>
+- WinRT 图像解码与编码：<https://learn.microsoft.com/windows/apps/develop/media-authoring-processing/imaging>
 - mpv 客户端 API 文档：<https://mpv.io/manual/master/#client-api>
