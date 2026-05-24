@@ -1,29 +1,43 @@
-# 波点音乐 SMTC Bridge 原型
+# 波点音乐 SMTC Bridge
 
-该工程为无源码波点音乐实现 SMTC 的原型：
+为 [波点音乐](https://www.bodian.cn) Windows 客户端实现 SMTC（System Media Transport Controls）集成。
 
-- `mpv_proxy`：同名代理 `libmpv-2.dll`，转发原 DLL，采集 mpv 状态，并在波点进程内发布 Windows SMTC。
-- 进程内 Bridge：随播放引擎初始化启动，异步绑定波点主窗口，结合波点日志补齐歌曲信息。
-- 部署脚本只准备复制出来的测试目录，不修改原安装目录。
+通过同名代理 DLL 替换原 `libmpv-2.dll`，在波点进程内采集 mpv 播放状态，解析应用日志获取歌曲元数据，发布到 Windows SMTC。
 
-## 构建
+## 原理
+
+```
+bodian_pc.exe → libmpv-2.dll (代理)
+                     ├─ 转发原始导出到 libmpv_real.dll
+                     ├─ 采集 mpv 播放状态
+                     └─ 启动进程内 Bridge → SMTC
+```
+
+## 前置依赖
+
+- Visual Studio（包含 C++ 桌面开发工作负载）
+- CMake 3.25+
+- Python 3.x
+
+## 使用方式
 
 ```powershell
 .\scripts\Build.ps1
 ```
 
-## 准备测试目录
+首次运行时自动检测波点安装目录，复制原始 `libmpv-2.dll` 后构建。也可手动将原 DLL 放入 `scripts\` 目录跳过检测。
 
-```powershell
-.\scripts\Prepare-BodianTest.ps1
-```
+构建完成后，交付目录 `dist\` 包含：
+- `libmpv-2.dll` — 代理 DLL
+- `libmpv_real.dll` — 原始 DLL（已重命名）
 
-## 启动
+备份波点安装目录的原 `libmpv-2.dll`，将 `dist\*` 全部复制到安装目录即可。
 
-```powershell
-.\bodian-test\bodian\bodian_pc.exe
-```
+## 回退
 
-## 回退测试目录
+用备份的原始 `libmpv-2.dll` 恢复即可。
 
-在测试目录中删除代理 `libmpv-2.dll`，再把 `libmpv_real.dll` 改回 `libmpv-2.dll`。
+## 参考资料
+
+- [SMTC 手动控制](https://learn.microsoft.com/windows/apps/develop/media-playback/system-media-transport-controls)
+- [mpv 客户端 API](https://mpv.io/manual/master/#client-api)

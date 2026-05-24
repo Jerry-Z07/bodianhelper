@@ -7,37 +7,22 @@
 - `mpv_proxy`：生成同名 `libmpv-2.dll`，转发原始 `libmpv_real.dll` 的导出，并采集 mpv 播放状态。
 - 进程内 Bridge：由代理 DLL 在波点进程内启动，结合波点日志解析歌曲元数据，并发布到 Windows SMTC。
 
-默认只操作仓库根目录和 `bodian-test` 复制目录。未经明确确认，不得修改 `C:\Program Files (x86)\bodian`。
+操作范围仅限于仓库目录。用户自行将原始 `libmpv-2.dll` 复制到 `scripts/` 目录供构建使用（首次运行 Build.ps1 时自动检测并复制）。
 
 ## 安全边界
 
-- 原始安装目录仅作为读取源，用于生成代理导出表和复制测试目录。
-- 部署脚本只准备 `E:\VMShare\board\test\bodian-test\bodian`。
-- 禁止直接替换原安装目录下的 `libmpv-2.dll`，除非用户明确要求并再次确认。
-- 遇到运行时崩溃、无法启动、SMTC 无会话等问题，优先在复制测试目录复现和修复。
-- 高风险操作（删除目录、覆盖原安装、停止用户正在使用的进程）必须先说明目标路径和影响，再取得确认。
+- 原始 DLL 仅放置在 `scripts/` 目录作为构建输入，仓库不追踪该文件。
+- 构建产物是代理 `libmpv-2.dll`，由用户自行备份原文件后替换。
+- 修改代理来源（如 CMakeList.txt 中 BODIAN_ORIGINAL_DIR 默认值）必须先确认。
+- 遇到运行时崩溃、无法启动、SMTC 无会话等问题，用户应自行在测试环境中复现。
 
-## 构建与部署
-
-构建命令：
+## 构建
 
 ```powershell
 .\scripts\Build.ps1
 ```
 
-准备复制测试目录：
-
-```powershell
-.\scripts\Prepare-BodianTest.ps1
-```
-
-测试启动顺序：
-
-```powershell
-.\bodian-test\bodian\bodian_pc.exe
-```
-
-回退测试目录时，删除测试目录中的代理 `libmpv-2.dll`，再把 `libmpv_real.dll` 改回 `libmpv-2.dll`。
+构建产物位于 `build\bin\RelWithDebInfo\libmpv-2.dll`，同时打包到 `dist\` 目录（含 `libmpv_real.dll`）。
 
 ## 关键实现约束
 
@@ -67,15 +52,7 @@
 .\scripts\Build.ps1
 ```
 
-需要更新测试目录时继续运行：
-
-```powershell
-.\scripts\Prepare-BodianTest.ps1
-```
-
-涉及代理导出或 DLL 加载时，补充最小 smoke test：从 `bodian-test\bodian` 加载 `libmpv-2.dll`，调用转发导出 `mpv_client_api_version()`，期望返回有效版本值。
-
-涉及 Bridge 行为时，至少启动测试目录中的 `bodian_pc.exe` 数秒，确认波点进程可存活且无需单独 Bridge 进程。涉及封面时，确认无需生成 `%LOCALAPPDATA%\BodianSmtcBridge\album-art` 缓存目录。
+涉及代理导出或 DLL 加载时，确认构建产物 `build\bin\RelWithDebInfo\libmpv-2.dll` 可被依赖链加载（即 `libmpv_real.dll` 位于同一目录）。
 
 ## 参考资料
 

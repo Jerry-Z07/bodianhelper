@@ -1,4 +1,7 @@
-/# Ignore the copied test deployment directory (local test artefact)
+# ace-tool index cache (code search IDE tool)
+/.ace-tool/
+
+# Ignore the copied test deployment directory (local test artefact)
 /bodian-test/
 
 # Build directories and CMake output
@@ -46,7 +49,11 @@
 *.dll
 *.exe
 
+# Distribution output
+/dist/
+
 # Specific project-generated files
+/scripts/libmpv-2.dll
 /lib/RelWithDebInfo/
 /build/RelWithDebInfo/
 /build/*.recipe

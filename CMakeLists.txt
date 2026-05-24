@@ -6,8 +6,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(BODIAN_ORIGINAL_DIR "C:/Program Files (x86)/bodian" CACHE PATH "原始波点音乐安装目录")
+set(BODIAN_ORIGINAL_DIR "${CMAKE_SOURCE_DIR}/scripts" CACHE PATH "原始 libmpv-2.dll 所在目录")
 set(BODIAN_ORIGINAL_MPV "${BODIAN_ORIGINAL_DIR}/libmpv-2.dll" CACHE FILEPATH "原始 libmpv-2.dll 路径")
+if(NOT EXISTS "${BODIAN_ORIGINAL_MPV}")
+    message(FATAL_ERROR "请将原始 libmpv-2.dll 放入 ${BODIAN_ORIGINAL_DIR} 目录")
+endif()
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
