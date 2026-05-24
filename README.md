@@ -14,7 +14,7 @@
 
 ### 直接获取已编译的dll
 
-你可以在（待补充）获取已编译的dll，直接复制到安装目录替换即可（记得备份原文件）
+你可以在[Releases](https://github.com/Jerry-Z07/bodianhelper/releases/latest)中获取已编译完成的dll（在压缩包内），解压后将它们直接复制到安装目录替换即可（记得备份原文件）
 
 ### 自行编译
 
