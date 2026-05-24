@@ -2,7 +2,7 @@
 
 ## 项目范围
 
-本工程是为无源码的波点音乐 Windows 客户端实现 SMTC（System Media Transport Controls）集成的原型。当前方案由两部分组成：
+本工程是为波点音乐 Windows 客户端实现 SMTC（System Media Transport Controls）集成的原型。当前方案由两部分组成：
 
 - `mpv_proxy`：生成同名 `libmpv-2.dll`，转发原始 `libmpv_real.dll` 的导出，并采集 mpv 播放状态。
 - 进程内 Bridge：由代理 DLL 在波点进程内启动，结合波点日志解析歌曲元数据，并发布到 Windows SMTC。
