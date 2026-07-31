@@ -5,6 +5,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -72,6 +74,133 @@ using mpv_set_property_string_fn = int (*)(mpv_handle*, const char*, const char*
 using mpv_free_fn = void (*)(void*);
 using mpv_wait_event_fn = mpv_event* (*)(mpv_handle*, double);
 using mpv_wakeup_fn = void (*)(mpv_handle*);
+
+// 仅用于记录 NODE 类型取值（按需读取常见子类型，足够覆盖音频相关属性）。
+struct mpv_node {
+    int format;
+    union {
+        char* string;
+        int64_t int64;
+        double double_;
+        int flag;
+    } u;
+};
+
+// ---- 选项/属性记录（排查波点是否对音频做处理）----
+// 受环境变量 BODIAN_MPV_TRACE=1 控制，默认关闭，不影响正常 SMTC 功能。
+// 命中时把波点下发的 mpv 选项/属性/命令写入 %TEMP%\bodian_mpv_trace.log，
+// 同时输出到 OutputDebugString（可用 DebugView / 调试器查看）。
+constexpr wchar_t kTraceEnv[] = L"BODIAN_MPV_TRACE";
+constexpr wchar_t kTraceFile[] = L"bodian_mpv_trace.log";
+
+std::mutex g_trace_mutex;
+std::ofstream g_trace_file;
+bool g_trace_open = false;
+bool g_trace_checked = false;
+bool g_trace_enabled = false;
+
+bool TraceEnabled() {
+    if (g_trace_checked) {
+        return g_trace_enabled;
+    }
+    wchar_t buf[8]{};
+    const DWORD len = GetEnvironmentVariableW(kTraceEnv, buf, static_cast<DWORD>(std::size(buf)));
+    g_trace_enabled = (len > 0 && (buf[0] == L'1' || buf[0] == L'Y' || buf[0] == L'y'));
+    g_trace_checked = true;
+    return g_trace_enabled;
+}
+
+void OpenTrace() {
+    if (g_trace_open) {
+        return;
+    }
+    wchar_t tmp[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring path = std::wstring(tmp) + kTraceFile;
+    g_trace_file.open(path, std::ios::out | std::ios::app);
+    g_trace_open = true;
+}
+
+void TraceLine(const std::string& line) {
+    if (!TraceEnabled()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_trace_mutex);
+    OpenTrace();
+    if (g_trace_file.is_open()) {
+        g_trace_file << line << "\n";
+        g_trace_file.flush();
+    }
+    OutputDebugStringA(line.c_str());
+    OutputDebugStringA("\n");
+}
+
+std::string TraceTs() {
+    const auto now = std::chrono::system_clock::now();
+    const auto t = std::chrono::system_clock::to_time_t(now);
+    const int ms = static_cast<int>(
+        (std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000).count());
+    struct tm tm_buf {};
+    localtime_s(&tm_buf, &t);
+    char buf[32]{};
+    std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d", tm_buf.tm_hour, tm_buf.tm_min,
+                  tm_buf.tm_sec, ms);
+    return buf;
+}
+
+std::string FormatMpvValue(mpv_format format, const void* data) {
+    if (data == nullptr) {
+        return "(null)";
+    }
+    switch (format) {
+        case MPV_FORMAT_STRING:
+        case MPV_FORMAT_OSD_STRING:
+            return std::string("\"") + static_cast<const char*>(data) + "\"";
+        case MPV_FORMAT_FLAG:
+            return (*reinterpret_cast<const int*>(data) != 0) ? "true" : "false";
+        case MPV_FORMAT_INT64:
+            return std::to_string(*reinterpret_cast<const int64_t*>(data));
+        case MPV_FORMAT_DOUBLE:
+            return std::to_string(*reinterpret_cast<const double*>(data));
+        case MPV_FORMAT_NODE: {
+            const auto* n = reinterpret_cast<const mpv_node*>(data);
+            switch (n->format) {
+                case MPV_FORMAT_STRING:
+                case MPV_FORMAT_OSD_STRING:
+                    return std::string("NODE(str)=\"") + (n->u.string ? n->u.string : "") + "\"";
+                case MPV_FORMAT_FLAG:
+                    return std::string("NODE(flag)=") + (n->u.flag ? "true" : "false");
+                case MPV_FORMAT_INT64:
+                    return "NODE(int64)=" + std::to_string(n->u.int64);
+                case MPV_FORMAT_DOUBLE:
+                    return "NODE(double)=" + std::to_string(n->u.double_);
+                default:
+                    return "NODE(format=" + std::to_string(n->format) + ")";
+            }
+        }
+        case MPV_FORMAT_NODE_ARRAY:
+            return "NODE_ARRAY";
+        case MPV_FORMAT_NODE_MAP:
+            return "NODE_MAP";
+        case MPV_FORMAT_BYTE_ARRAY:
+            return "BYTE_ARRAY";
+        default:
+            return "format=" + std::to_string(format);
+    }
+}
+
+std::string FormatCommandArgs(const char** args) {
+    std::string s;
+    if (args != nullptr) {
+        for (int i = 0; args[i] != nullptr; ++i) {
+            if (i) {
+                s += " ";
+            }
+            s += args[i];
+        }
+    }
+    return s;
+}
 
 int64_t NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -354,6 +483,7 @@ extern "C" __declspec(dllexport) void mpv_free(void* data) {
 extern "C" __declspec(dllexport) int mpv_command(mpv_handle* handle, const char** args) {
     auto real = Real<mpv_command_fn>("mpv_command");
     const int result = real ? real(handle, args) : -1;
+    TraceLine(TraceTs() + " mpv_command args=\"" + FormatCommandArgs(args) + "\"");
     if (args != nullptr && args[0] != nullptr) {
         NotifyEvent(args[0], handle);
     }
@@ -363,6 +493,7 @@ extern "C" __declspec(dllexport) int mpv_command(mpv_handle* handle, const char*
 extern "C" __declspec(dllexport) int mpv_command_async(mpv_handle* handle, uint64_t reply_userdata, const char** args) {
     auto real = Real<mpv_command_async_fn>("mpv_command_async");
     const int result = real ? real(handle, reply_userdata, args) : -1;
+    TraceLine(TraceTs() + " mpv_command_async args=\"" + FormatCommandArgs(args) + "\"");
     if (args != nullptr && args[0] != nullptr) {
         NotifyEvent(args[0], handle);
     }
@@ -372,6 +503,7 @@ extern "C" __declspec(dllexport) int mpv_command_async(mpv_handle* handle, uint6
 extern "C" __declspec(dllexport) int mpv_command_string(mpv_handle* handle, const char* args) {
     auto real = Real<mpv_command_string_fn>("mpv_command_string");
     const int result = real ? real(handle, args) : -1;
+    TraceLine(TraceTs() + " mpv_command_string args=\"" + (args ? args : "?") + "\"");
     NotifyEvent(args ? args : "mpv_command_string", handle);
     return result;
 }
@@ -389,6 +521,9 @@ extern "C" __declspec(dllexport) char* mpv_get_property_string(mpv_handle* handl
 extern "C" __declspec(dllexport) int mpv_set_property(mpv_handle* handle, const char* name, mpv_format format, void* data) {
     auto real = Real<mpv_set_property_fn>("mpv_set_property");
     const int result = real ? real(handle, name, format, data) : -1;
+    TraceLine(TraceTs() + " mpv_set_property name=\"" + (name ? name : "?") +
+              "\" format=" + std::to_string(format) +
+              " value=" + FormatMpvValue(format, data));
     NotifyEvent(name ? name : "mpv_set_property", handle);
     return result;
 }
@@ -396,7 +531,43 @@ extern "C" __declspec(dllexport) int mpv_set_property(mpv_handle* handle, const 
 extern "C" __declspec(dllexport) int mpv_set_property_string(mpv_handle* handle, const char* name, const char* data) {
     auto real = Real<mpv_set_property_string_fn>("mpv_set_property_string");
     const int result = real ? real(handle, name, data) : -1;
+    TraceLine(TraceTs() + " mpv_set_property_string name=\"" + (name ? name : "?") +
+              "\" value=\"" + (data ? data : "?") + "\"");
     NotifyEvent(name ? name : "mpv_set_property_string", handle);
+    return result;
+}
+
+extern "C" __declspec(dllexport) int mpv_set_option(mpv_handle* handle, const char* name,
+                                                    mpv_format format, void* data) {
+    using fn = int (*)(mpv_handle*, const char*, mpv_format, void*);
+    auto real = Real<fn>("mpv_set_option");
+    const int result = real ? real(handle, name, format, data) : -1;
+    TraceLine(TraceTs() + " mpv_set_option name=\"" + (name ? name : "?") +
+              "\" format=" + std::to_string(format) +
+              " value=" + FormatMpvValue(format, data));
+    return result;
+}
+
+extern "C" __declspec(dllexport) int mpv_set_option_string(mpv_handle* handle, const char* name,
+                                                          const char* data) {
+    using fn = int (*)(mpv_handle*, const char*, const char*);
+    auto real = Real<fn>("mpv_set_option_string");
+    const int result = real ? real(handle, name, data) : -1;
+    TraceLine(TraceTs() + " mpv_set_option_string name=\"" + (name ? name : "?") +
+              "\" value=\"" + (data ? data : "?") + "\"");
+    return result;
+}
+
+extern "C" __declspec(dllexport) int mpv_set_property_async(mpv_handle* handle,
+                                                           uint64_t reply_userdata,
+                                                           const char* name, mpv_format format,
+                                                           void* data) {
+    using fn = int (*)(mpv_handle*, uint64_t, const char*, mpv_format, void*);
+    auto real = Real<fn>("mpv_set_property_async");
+    const int result = real ? real(handle, reply_userdata, name, format, data) : -1;
+    TraceLine(TraceTs() + " mpv_set_property_async name=\"" + (name ? name : "?") +
+              "\" format=" + std::to_string(format) +
+              " value=" + FormatMpvValue(format, data));
     return result;
 }
 
