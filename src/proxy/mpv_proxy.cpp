@@ -38,7 +38,12 @@ enum mpv_format {
 namespace {
 
 constexpr wchar_t kRealDllName[] = L"libmpv_real.dll";
-constexpr int64_t kStateSnapshotIntervalMs = 5000;
+// 定期采样间隔：1s。兼顾进度刷新及时性与对 mpv 的干扰最小化。
+// 所有 mpv 属性读取统一由 SamplerWorker 执行，避免在波点主线程（mpv_wait_event/
+// mpv_command/mpv_set_property 的调用线程）上同步读取属性，从而不延迟波点对 mpv 事件的处理。
+// 见 https://mpv.io/manual/master/#client-api ：client API 线程安全，但同一 handle 上
+// 的属性读取仍会与 mpv 内部核心竞争锁，快速切歌时累积会拖慢事件处理，间接触发 wasapi 初始化失败。
+constexpr int64_t kStateSnapshotIntervalMs = 1000;
 
 HMODULE g_real_module = nullptr;
 std::once_flag g_load_once;
@@ -46,7 +51,11 @@ std::atomic<mpv_handle*> g_active_handle{nullptr};
 std::atomic<bool> g_sampler_running{false};
 std::atomic<bool> g_bridge_started{false};
 std::atomic<bool> g_process_exiting{false};
+// 上次采样时间戳，SamplerWorker 据此判断是否到定期采样时刻。
 std::atomic<int64_t> g_last_snapshot_ms{0};
+// 脏标志：mpv API 拦截路径（command/set_property/wait_event）检测到状态可能变化时置位，
+// SamplerWorker 下一个 tick 立即采样。替代原先在调用线程同步采样的做法。
+std::atomic<bool> g_snapshot_pending{false};
 std::atomic<int64_t> g_ignore_synthetic_media_key_until_ms{0};
 std::thread g_sampler_thread;
 
@@ -171,19 +180,10 @@ void SendStateSnapshot(mpv_handle* handle) {
     bodian_bridge::SubmitPlaybackState(state);
 }
 
-void SendStateSnapshotThrottled(mpv_handle* handle) {
-    if (handle == nullptr) {
-        return;
-    }
-
-    const int64_t now = NowMs();
-    int64_t last = g_last_snapshot_ms.load();
-    while (now - last >= kStateSnapshotIntervalMs) {
-        if (g_last_snapshot_ms.compare_exchange_weak(last, now)) {
-            SendStateSnapshot(handle);
-            return;
-        }
-    }
+// 请求一次异步采样：仅置脏标志，SamplerWorker 会在下一个 tick（最多 1s）内执行。
+// 用于 mpv API 拦截路径，避免在波点调用线程上同步读取 mpv 属性。
+void RequestSnapshot() {
+    g_snapshot_pending.store(true);
 }
 
 void SetPause(bool pause) {
@@ -195,7 +195,9 @@ void SetPause(bool pause) {
 
     int value = pause ? 1 : 0;
     set_property(handle, "pause", MPV_FORMAT_FLAG, &value);
-    SendStateSnapshot(handle);
+    // SMTC 控制回调（Play/Pause）需要立即反映状态，但仍在 SamplerWorker 线程异步采样，
+    // 避免在回调线程上读取 mpv 属性。延迟最多 1s 可接受（SMTC 按钮反馈不需要毫秒级）。
+    RequestSnapshot();
 }
 
 void SeekToMs(int64_t position_ms) {
@@ -208,7 +210,7 @@ void SeekToMs(int64_t position_ms) {
     std::string seconds = std::to_string(static_cast<double>(position_ms) / 1000.0);
     const char* args[] = {"seek", seconds.c_str(), "absolute", "exact", nullptr};
     command(handle, args);
-    SendStateSnapshot(handle);
+    RequestSnapshot();
 }
 
 void SendSyntheticMediaKey(BYTE virtual_key) {
@@ -240,9 +242,16 @@ void SamplerWorker() {
     while (!g_process_exiting.load()) {
         mpv_handle* handle = g_active_handle.load();
         if (handle != nullptr) {
-            SendStateSnapshot(handle);
+            const int64_t now = NowMs();
+            // 满足以下任一条件则采样：脏标志被置位（mpv API 拦截路径检测到变化）、
+            // 或到了定期采样时刻（兜底保活）。
+            const bool pending = g_snapshot_pending.exchange(false);
+            const bool due = (now - g_last_snapshot_ms.load()) >= kStateSnapshotIntervalMs;
+            if (pending || due) {
+                SendStateSnapshot(handle);
+            }
         }
-        Sleep(static_cast<DWORD>(kStateSnapshotIntervalMs));
+        Sleep(200);  // 短轮询间隔，保证脏标志触发后最多 200ms 采样
     }
 }
 
@@ -259,7 +268,11 @@ void NotifyEvent(std::string_view name, mpv_handle* handle) {
     if (handle == nullptr) {
         bodian_bridge::MarkPlaybackDisconnected();
     } else {
-        SendStateSnapshot(handle);
+        // 仅请求异步采样，不在调用线程（波点主线程）上同步读取 mpv 属性。
+        // 原先在此同步调用 SendStateSnapshot 会读取 9 个属性，快速切歌时大量
+        // mpv_command/mpv_set_property 调用累积，延迟波点对 mpv 事件的处理，
+        // 间接触发 wasapi 音频设备初始化失败（no sound）。
+        RequestSnapshot();
     }
 }
 
@@ -391,7 +404,10 @@ extern "C" __declspec(dllexport) mpv_event* mpv_wait_event(mpv_handle* handle, d
     auto real = Real<mpv_wait_event_fn>("mpv_wait_event");
     mpv_event* event = real ? real(handle, timeout) : nullptr;
     if (event != nullptr) {
-        SendStateSnapshotThrottled(handle);
+        // 仅请求异步采样，不在波点主线程上同步读取属性。
+        // 波点主线程需要尽快处理完 mpv 事件并返回等待下一个事件，同步属性读取会
+        // 延迟事件循环，快速切歌时影响音频设备初始化时序。
+        RequestSnapshot();
     }
     return event;
 }

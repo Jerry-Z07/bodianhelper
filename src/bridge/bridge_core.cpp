@@ -72,6 +72,9 @@ SmtcPublishCache g_smtc_publish;
 
 std::atomic<bool> g_started{false};
 std::atomic<bool> g_running{false};
+// 切歌时置位，BridgeWorker 检测到后立即解析日志元数据，缩短正确标题刷新延迟。
+// 配合 SubmitPlaybackState 中对 URL/文件名式 title 的过滤，避免 SMTC 短暂显示流地址。
+std::atomic<bool> g_metadata_refresh_requested{false};
 std::thread g_bridge_thread;
 
 std::wstring Utf8ToWide(std::string_view value) {
@@ -303,13 +306,43 @@ PlaybackState CurrentStateSnapshot() {
     return g_state;
 }
 
+// 判断字符串是否像流媒体 URL 或原始文件名（而非真实歌曲标题）。
+// mpv 在播放 HTTP 流时，media-title 默认回退为 URL 末段或带参数的文件名，
+// 例如 "F000000XTeWx2WdcRJ.flac?from=bodian"。这类字符串不应作为 SMTC 标题显示，
+// 应等待日志解析提供真实歌曲名。
+bool LooksLikeStreamUrlOrFilename(std::string_view value) {
+    if (value.empty()) {
+        return false;
+    }
+    // URL 协议头
+    if (StartsWithAsciiIgnoreCase(value, "http://") || StartsWithAsciiIgnoreCase(value, "https://")) {
+        return true;
+    }
+    // URL 查询字符串特征
+    if (value.find('?') != std::string_view::npos || value.find('=') != std::string_view::npos) {
+        return true;
+    }
+    // 常见音频扩展名（含加密格式如 mflac/mgg/mmp4）
+    static constexpr std::string_view kExtensions[] = {
+        ".flac", ".mp3", ".ogg", ".aac", ".m4a", ".wav", ".wma",
+        ".mflac", ".mgg", ".mmp4", ".mp4", ".opus", ".webm"};
+    for (const auto ext : kExtensions) {
+        if (EndsWithAsciiIgnoreCase(value, ext)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string BuildDisplayKey(const PlaybackState& state) {
+    // display_key 不含 path/filename：切歌时 path/filename 立即变化，但真实标题/艺术家/专辑
+    // 仍需等待日志解析。若纳入 path/filename，切歌瞬间会因 key 变化触发 display 更新，
+    // 此时 title 可能是 URL 式文件名，导致 SMTC 短暂显示错误标题。
     std::ostringstream key;
     key << state.title << '\n'
         << state.artist << '\n'
         << state.album << '\n'
-        << state.album_pic << '\n'
-        << state.filename;
+        << state.album_pic;
     return key.str();
 }
 
@@ -447,6 +480,11 @@ void UpdateSmtc() {
 
     const std::string display_key = BuildDisplayKey(state);
     update_display = !g_smtc_publish.has_display || display_key != g_smtc_publish.display_key;
+    // title 为空时不更新 display：切歌后日志元数据尚未解析到时，title 可能被过滤为空，
+    // 此时不应刷新 SMTC 显示（保留上一首的正确显示），等待日志提供真实标题后再更新。
+    if (update_display && state.title.empty()) {
+        update_display = false;
+    }
     if (update_display) {
         g_smtc_publish.has_display = true;
         g_smtc_publish.display_key = display_key;
@@ -465,7 +503,7 @@ void UpdateSmtc() {
         if (update_display) {
             auto updater = g_smtc.DisplayUpdater();
             updater.Type(media::MediaPlaybackType::Music);
-            updater.MusicProperties().Title(winrt::hstring(Utf8ToWide(state.title.empty() ? state.filename : state.title)));
+            updater.MusicProperties().Title(winrt::hstring(Utf8ToWide(state.title)));
             updater.MusicProperties().Artist(winrt::hstring(Utf8ToWide(state.artist)));
             updater.MusicProperties().AlbumTitle(winrt::hstring(Utf8ToWide(state.album)));
             updater.Thumbnail(CoverThumbnailReference(state.album_pic));
@@ -611,7 +649,10 @@ void BridgeWorker() {
             EnsureSmtcBoundToMainWindow();
 
             const int64_t now_ms = NowMs();
-            if (now_ms - last_metadata_ms >= std::chrono::duration_cast<std::chrono::milliseconds>(2s).count()) {
+            // 切歌时 SubmitPlaybackState 置位 g_metadata_refresh_requested，
+            // 立即解析日志以尽快获取正确标题，避免 SMTC 长时间显示旧标题。
+            const bool refresh_requested = g_metadata_refresh_requested.exchange(false);
+            if (refresh_requested || now_ms - last_metadata_ms >= std::chrono::duration_cast<std::chrono::milliseconds>(2s).count()) {
                 last_metadata_ms = now_ms;
                 if (auto metadata = ParseMetadataFromLogs()) {
                     MergeMetadata(*metadata);
@@ -653,9 +694,10 @@ void StopSmtcBridge() {
 }
 
 void SubmitPlaybackState(const PlaybackState& state) {
+    bool track_changed = false;
     {
         std::lock_guard lock(g_state_mutex);
-        const bool track_changed =
+        track_changed =
             (!state.path.empty() && state.path != g_state.path) ||
             (!state.filename.empty() && state.filename != g_state.filename);
         g_state.connected = state.connected;
@@ -672,10 +714,25 @@ void SubmitPlaybackState(const PlaybackState& state) {
             g_state.artist.clear();
             g_state.album.clear();
             g_state.album_pic.clear();
-            g_state.title = state.title;
+            // mpv media-title 对 HTTP 流可能返回 URL 末段或带参数的文件名（如
+            // "F000000XTeWx2WdcRJ.flac?from=bodian"），不应作为标题显示。
+            // 清除 title，等待日志解析提供真实歌曲名。日志解析通常在切歌后立即完成
+            // （波点切歌时即写日志），BridgeWorker 检测到 refresh 请求后会立即解析。
+            if (LooksLikeStreamUrlOrFilename(state.title)) {
+                g_state.title.clear();
+            } else {
+                g_state.title = state.title;
+            }
         } else if (!state.title.empty() && g_state.title.empty()) {
-            g_state.title = state.title;
+            // 非切歌场景下 title 从空变为非空，仅接受非 URL/文件名式的值。
+            if (!LooksLikeStreamUrlOrFilename(state.title)) {
+                g_state.title = state.title;
+            }
         }
+    }
+    if (track_changed) {
+        // 请求 BridgeWorker 立即解析日志元数据，缩短正确标题刷新延迟。
+        g_metadata_refresh_requested.store(true);
     }
     UpdateSmtc();
 }
